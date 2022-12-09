@@ -1,25 +1,23 @@
 module JMQTT
 
 function read_remaining_length(sock)
-	rem = 0
+	rem::Int64 = 0
 	pow = 0
 
 	while true
-		b = read(sock, 1)[1]
-		rem = rem + b * 128^pow
+		b = read(sock, UInt8)
+		rem = rem + (b & 127) * 128^pow
 		pow = pow + 1
 
-		if b != 128
-			break
-		end
-
-		if b == UInt8[]
+		if b & 128 == 0
 			break
 		end
 	end
 
 	return rem
 end
+
+abstract type PubPacket end
 
 struct CONNECTPacket
 	protocol_level::UInt8			
@@ -33,7 +31,7 @@ struct CONNECTPacket
 
 	keep_alive::UInt16
 
-	client_id::String
+	client_id::Union{String, Nothing}
 	will_topic::Union{String, Nothing}
 	will_message::Union{Array{UInt8}, Nothing}
 	username::Union{String, Nothing}
@@ -54,7 +52,7 @@ struct CONNACKPacket
 	return_code::UInt8
 end
 
-struct PUBLISHPacket
+struct PUBLISHPacket <: PubPacket
 	dup_flag::Bool
 	qos::UInt8
 	retain::Bool
@@ -77,6 +75,21 @@ end
 
 struct PUBCOMPPacket
 	packet_id::UInt16
+end
+
+struct TopicRequest
+	topic::String
+	qos::UInt8
+end
+
+struct SUBSCRIBEPacket
+	packet_id::UInt16
+	topic_reqs::Vector{Any}
+end
+
+struct SUBACKPacket
+	packet_id::UInt16
+	return_codes::Array{UInt8}
 end
 
 function read_CONNECT(sock, flags, rem_len)
@@ -106,7 +119,7 @@ function read_CONNECT(sock, flags, rem_len)
 	payload = read!(sock, Array{UInt8, 1}(undef, payload_len))
 
 	# Default payload field values
-	client_id = ""
+	client_id = nothing
 	will_topic = nothing
 	will_message = nothing
 	username = nothing
@@ -117,11 +130,8 @@ function read_CONNECT(sock, flags, rem_len)
 	position = 1
 	id_length = payload[position] * 256 + payload[position+1]
 	position = position + 2
-	if id_length < 1 || id_length > 23
-		error("Incorrect client ID length: $id_length")
-	end
 
-	client_id = String(payload[position:position+id_length-1])
+	client_id = (id_length < 1 || id_length > 23) ? "" : String(payload[position:position+id_length-1])
 	position = position + id_length
 
 	# Get will fields if flag is set
@@ -220,6 +230,42 @@ function read_PUBREL(sock, flags, rem_len)
 	return PUBRELPacket(id)
 end
 
+function read_PUBCOMP(sock, flags, rem_len)
+	error("Not implemented")
+end
+
+function read_SUBSCRIBE(sock, flags, rem_len)
+	packet_id = read_var_length(sock)	
+	payload_len = rem_len - 2
+	println("packet_id: $packet_id")
+	println("payload_len: $payload_len")
+
+	#payload = read!(sock, Array{UInt8, 1}(undef, payload_len))
+
+	read_amount = 0
+
+	topics::Vector{TopicRequest} = []
+	while read_amount < payload_len
+		t_length = read(sock, UInt8)*256 + read(sock, UInt8)
+		read_amount = read_amount + 2
+		println("topic length: $t_length")
+
+		topic = String(read!(sock, Array{UInt8, 1}(undef, t_length)))
+		read_amount = read_amount + t_length
+
+
+		qos = read(sock, UInt8)
+		read_amount = read_amount + 1
+
+		println("QOS: $qos")
+
+
+		push!(topics, TopicRequest(topic, qos))
+	end
+
+	return SUBSCRIBEPacket(packet_id, topics)
+end
+
 
 # Reads the two byte length for a given variable field length from a socket
 function read_var_length(sock)
@@ -232,12 +278,13 @@ PACKET_FUNCTIONS = [
 					read_PUBLISH,
 					read_PUBACK,
 					read_PUBREC,
-					read_PUBREL
+					read_PUBREL,
+					read_PUBCOMP,
+					read_SUBSCRIBE
 				   	]
 
 function read_packet(sock)
 	first = read(sock, UInt8)
-	println(first)
 
 	control = (first >>> 4) & 0b00001111
 	flags = (first & 0b00001111)
@@ -265,11 +312,23 @@ function serialize_packet(packet::CONNACKPacket)
 	return out
 end
 
+function serialize_rem_len(len::Int)
+	out::Array{UInt8} = []
+	while len > 0
+		byte = len % 128
+		len = UInt(trunc(len / 128))
+		if len > 0
+			byte = byte | 128
+		end
+
+		append!(out, byte)
+	end
+	return out
+end
+
 function serialize_packet(packet::PUBACKPacket)
 	msb = trunc(UInt8, packet.packet_id / 256)
 	lsb = packet.packet_id % 256
-	println(msb)
-	println(lsb)
 
 	out::Array{UInt8} = [0b01000000, 2, msb, lsb]
 	return out
@@ -278,8 +337,6 @@ end
 function serialize_packet(packet::PUBRECPacket)
 	msb = trunc(UInt8, packet.packet_id / 256)
 	lsb = packet.packet_id % 256
-	println(msb)
-	println(lsb)
 
 	out::Array{UInt8} = [0b01010000, 2, msb, lsb]
 	return out
@@ -288,8 +345,6 @@ end
 function serialize_packet(packet::PUBRELPacket)
 	msb = trunc(UInt8, packet.packet_id / 256)
 	lsb = packet.packet_id % 256
-	println(msb)
-	println(lsb)
 
 	out::Array{UInt8} = [0b01100010, 2, msb, lsb]
 	return out
@@ -298,10 +353,22 @@ end
 function serialize_packet(packet::PUBCOMPPacket)
 	msb = trunc(UInt8, packet.packet_id / 256)
 	lsb = packet.packet_id % 256
-	println(msb)
-	println(lsb)
 
 	out::Array{UInt8} = [0b01110000, 2, msb, lsb]
+	return out
+end
+
+function serialize_packet(packet::SUBACKPacket)
+	msb = trunc(UInt8, packet.packet_id / 256)
+	lsb = packet.packet_id % 256
+
+	println("LENGTH: $(packet.return_codes)")
+	rem_len = serialize_rem_len(length(packet.return_codes)+2)
+	println(rem_len)
+
+	out::Array{UInt8, 1} = vcat([0b10010000], rem_len, [msb, lsb], packet.return_codes)
+	println(out)
+
 	return out
 end
 
